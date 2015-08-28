@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -303,19 +302,15 @@ func (nc *nspawnCluster) createMember(id string) (m Member, err error) {
 		// minimum requirements for running systemd/coreos in a container
 		fmt.Sprintf("mkdir -p %s/usr", fsdir),
 		fmt.Sprintf("cp /etc/os-release %s/etc", fsdir),
-		fmt.Sprintf("ln -s /proc/self/mounts %s/etc/mtab", fsdir),
-		fmt.Sprintf("ln -s usr/lib64 %s/lib64", fsdir),
-		fmt.Sprintf("ln -s lib64 %s/lib", fsdir),
-		fmt.Sprintf("ln -s usr/bin %s/bin", fsdir),
-		fmt.Sprintf("ln -s usr/sbin %s/sbin", fsdir),
-		fmt.Sprintf("mkdir -p %s/home/core/.ssh", fsdir),
-		fmt.Sprintf("chown -R core:core %s/home/core", fsdir),
+		fmt.Sprintf("systemd-tmpfiles --root=%s --create /usr/lib/tmpfiles.d/baselayout.conf /usr/lib/tmpfiles.d/baselayout-etc.conf /usr/lib/tmpfiles.d/baselayout-usr.conf /usr/lib/tmpfiles.d/baselayout-home.conf /usr/lib/tmpfiles.d/libsemanage.conf /usr/lib/tmpfiles.d/selinux-base.conf", fsdir),
+		fmt.Sprintf("mkdir -p %s/var/log/journal", fsdir),
+		fmt.Sprintf("mkdir -p %s/etc/tmpfiles.d", fsdir),
+		fmt.Sprintf("ln -s /dev/null %s/etc/tmpfiles.d/journal-nocow.conf", fsdir),
 
 		// We don't need this, and it's slow, so mask it
 		fmt.Sprintf("ln -s /dev/null %s/etc/systemd/system/systemd-udev-hwdb-update.service", fsdir),
 
-		// set up directory for sshd_config (see below)
-		fmt.Sprintf("mkdir -p %s/etc/ssh", fsdir),
+		fmt.Sprintf("systemd-machine-id-setup --root=%s", fsdir),
 	}
 
 	for _, cmd := range cmds {
@@ -327,30 +322,6 @@ func (nc *nspawnCluster) createMember(id string) (m Member, err error) {
 		}
 	}
 
-	sshd_config := `# Use most defaults for sshd configuration.
-UsePrivilegeSeparation sandbox
-Subsystem sftp internal-sftp
-UseDNS no
-`
-
-	if err = ioutil.WriteFile(path.Join(fsdir, "/etc/ssh/sshd_config"), []byte(sshd_config), 0644); err != nil {
-		log.Printf("Failed writing sshd_config: %v", err)
-		return
-	}
-
-	// For expediency, generate the minimal viable SSH keys for the host, instead of the default set
-	sshd_keygen := `[Unit]
-	Description=Generate sshd host keys
-	Before=sshd.service
-
-	[Service]
-	Type=oneshot
-	RemainAfterExit=yes
-	ExecStart=/usr/bin/ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -N "" -b 768`
-	if err = ioutil.WriteFile(path.Join(fsdir, "/etc/systemd/system/sshd-keygen.service"), []byte(sshd_keygen), 0644); err != nil {
-		log.Printf("Failed writing sshd-keygen.service: %v", err)
-		return
-	}
 
 	if err = nc.insertFleetd(fsdir); err != nil {
 		log.Printf("Failed preparing fleetd in filesystem: %v", err)
@@ -368,8 +339,8 @@ UseDNS no
 		"-b",
 		"--uuid=" + nm.uuid,
 		fmt.Sprintf("-M %s%s", nc.name, nm.ID()),
-		"--capability=CAP_NET_BIND_SERVICE,CAP_SYS_TIME", // needed for ntpd
 		"--network-bridge fleet0",
+		"--link-journal=host",
 		fmt.Sprintf("-D %s", fsdir),
 	}, " ")
 	log.Printf("Creating nspawn container: %s", exec)
@@ -385,7 +356,7 @@ UseDNS no
 		return
 	}
 
-	alarm := time.After(10 * time.Second)
+	alarm := time.After(30 * time.Second)
 	addr := fmt.Sprintf("%s:%d", nm.IP(), fleetAPIPort)
 	for {
 		select {
